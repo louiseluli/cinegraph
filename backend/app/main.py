@@ -26,6 +26,7 @@ from .db import ping_db
 # Routers / services
 from .routes_tmdb import router as tmdb_router
 from .routes_stats import router as stats_router
+from .recs import router as recs_router
 from .tmdb import tmdb
 
 
@@ -108,3 +109,5 @@ def healthz():
 app.include_router(tmdb_router)
 
 app.include_router(stats_router)
+
+app.include_router(recs_router, prefix="/recs")
