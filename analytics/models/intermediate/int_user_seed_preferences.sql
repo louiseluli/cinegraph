@@ -26,35 +26,16 @@
 
 {{ config(
     materialized='table',
-    post_hook=[
-      -- primary key (user_id, tconst) with a safety wrapper
-      "do $$ begin
-          if not exists (
-            select 1 from pg_constraint
-            where conname = 'int_user_seed_preferences_pk'
-              and conrelid = '{{ this }}'::regclass
-          ) then
-            alter table {{ this }} add constraint int_user_seed_preferences_pk primary key (user_id, tconst);
-          end if;
-        end $$;",
-      -- index on user_id
-      "do $$ begin
-          if not exists (
-            select 1 from pg_indexes where schemaname=current_schema() and indexname='ix_user_seed_user'
-          ) then
-            create index ix_user_seed_user on {{ this }} (user_id);
-          end if;
-        end $$;",
-      -- index on tconst
-      "do $$ begin
-          if not exists (
-            select 1 from pg_indexes where schemaname=current_schema() and indexname='ix_user_seed_tconst'
-          ) then
-            create index ix_user_seed_tconst on {{ this }} (tconst);
-          end if;
-        end $$;"
+    -- Native dbt constraints (postgres adapter 1.8+)
+    constraints = {
+      "primary_key": ["user_id", "tconst"]
+    },
+    indexes = [
+      {"columns": ["user_id"]},
+      {"columns": ["tconst"]}
     ]
 ) }}
+
 
 -- Create an EMPTY table with the correct schema. The WHERE false keeps it empty.
 select
