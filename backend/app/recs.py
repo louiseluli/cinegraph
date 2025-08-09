@@ -17,10 +17,31 @@ import psycopg
 router = APIRouter(prefix="/recs", tags=["recs"])
 
 def _dsn() -> str:
+    # Prefer ANALYTICS_DSN or fall back to DATABASE_URL
     dsn = os.getenv("ANALYTICS_DSN") or os.getenv("DATABASE_URL") or ""
-    # If someone set localhost/127.0.0.1 for CLI, rewrite for container
-    dsn = dsn.replace("@localhost:", "@db:").replace("@127.0.0.1:", "@db:")
+
+    # If someone put a host-only DSN, keep it.
+    # If it uses localhost/127.0.0.1, rewrite to Docker service "db" on the correct internal port 5432.
+    # We normalize both host and port robustly.
+    def _normalize_local_to_db(s: str) -> str:
+        # Common cases:
+        #   postgresql://user:pass@localhost:5433/db -> ...@db:5432/db
+        #   postgresql://user:pass@127.0.0.1:5433/db -> ...@db:5432/db
+        #   postgresql://user:pass@localhost/db      -> ...@db:5432/db
+        for needle in ("@localhost:", "@127.0.0.1:"):
+            if needle in s:
+                return s.replace(needle, "@db:5432:")
+        # handle no explicit port
+        for needle in ("@localhost/", "@127.0.0.1/"):
+            if needle in s:
+                return s.replace(needle, "@db:5432/")
+        return s
+
+    dsn = _normalize_local_to_db(dsn)
+
+    # Final fallback if empty
     return dsn or "postgresql://cinegraph_user:changeme_strong_password@db:5432/cinegraph"
+
 
 DB_DSN = _dsn()
 
