@@ -1,0 +1,27 @@
+# analytics/dbt_project.yml
+name: cinegraph
+version: 0.1.0
+config-version: 2
+
+# dbt will look for a profile named "cinegraph" (we'll add it next step).
+profile: cinegraph
+
+# Keep models organized by layer. We'll introduce these dirs gradually.
+model-paths:
+  - models
+
+# Where dbt will put compiled artifacts (we'll gitignore in a later step).
+target-path: target
+clean-targets:
+  - target
+  - dbt_packages
+
+models:
+  cinegraph:
+    # default schema for dev; prod can override via profiles
+    +schema: analytics
+    # as we add folders, we can set materializations here
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
