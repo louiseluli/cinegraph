@@ -4,7 +4,7 @@
 # - Reads user seed titles from analytics.int_user_seed_preferences
 # - Builds a single preference vector (weighted average) from seed rows
 # - Computes cosine similarity to candidate titles and returns top-k
-# - Supports filters: since_year, min_votes, genre_any (comma-separated)
+# - Supports filters: since_year, min_votes, genre_any (comma-separated), title_types
 # - Uses container-safe DSN (db:5432) by default
 
 from typing import List, Optional
@@ -18,19 +18,47 @@ router = APIRouter(prefix="/recs", tags=["recs"])
 
 def _dsn() -> str:
     dsn = os.getenv("ANALYTICS_DSN") or os.getenv("DATABASE_URL") or ""
-    # guard: if someone set localhost/127.0.0.1 for CLI, rewrite for container
+    # If someone set localhost/127.0.0.1 for CLI, rewrite for container
     dsn = dsn.replace("@localhost:", "@db:").replace("@127.0.0.1:", "@db:")
     return dsn or "postgresql://cinegraph_user:changeme_strong_password@db:5432/cinegraph"
 
 DB_DSN = _dsn()
 
-# Columns used for features — must match analytics.int_titles_features
-FEATURE_COLS = [
-    "year_norm", "runtime_norm", "rating_norm",
-    "is_action", "is_comedy", "is_drama", "is_romance", "is_horror",
-    "is_war", "is_thriller", "is_crime", "is_fantasy", "is_scifi",
-    "is_family", "is_western", "is_animation", "is_documentary"
+# Which columns become our feature vector (documentation only; we now build it in SQL)
+# These names match analytics.int_titles_features (see \d+ in your logs)
+FEATURE_DOC = [
+    "f_year_norm", "f_runtime_norm", "f_rating_norm",
+    # one-hots for genres present in the title (multi-hot)
+    "g_action","g_adventure","g_animation","g_comedy","g_crime","g_documentary",
+    "g_drama","g_family","g_fantasy","g_history","g_horror","g_music","g_mystery",
+    "g_romance","g_scifi","g_tvmovie","g_thriller","g_war","g_western"
 ]
+
+# Map user-friendly genre tokens -> warehouse boolean columns
+GENRE_TO_COL = {
+    "action":"g_action",
+    "adventure":"g_adventure",
+    "animation":"g_animation",
+    "comedy":"g_comedy",
+    "crime":"g_crime",
+    "documentary":"g_documentary",
+    "drama":"g_drama",
+    "family":"g_family",
+    "fantasy":"g_fantasy",
+    "history":"g_history",
+    "horror":"g_horror",
+    "music":"g_music",
+    "mystery":"g_mystery",
+    "romance":"g_romance",
+    "sci-fi":"g_scifi",  # allow sci-fi
+    "scifi":"g_scifi",
+    "science fiction":"g_scifi",
+    "tv movie":"g_tvmovie",
+    "tvmovie":"g_tvmovie",
+    "thriller":"g_thriller",
+    "war":"g_war",
+    "western":"g_western",
+}
 
 def _cosine(a: List[float], b: List[float]) -> float:
     dot = sum(x*y for x, y in zip(a, b))
@@ -40,13 +68,45 @@ def _cosine(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
+# --- Helper: same JSON feature vector expression used for seeds & candidates ---
+# We COALESCE to 0.0 and cast booleans to int so Python gets a clean list[float].
+FEATURE_JSON_SQL = """
+json_build_array(
+  COALESCE(f.f_year_norm::double precision, 0.0),
+  COALESCE(f.f_runtime_norm::double precision, 0.0),
+  COALESCE(f.f_rating_norm::double precision, 0.0),
+
+  (CASE WHEN f.g_action THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_adventure THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_animation THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_comedy THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_crime THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_documentary THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_drama THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_family THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_fantasy THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_history THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_horror THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_music THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_mystery THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_romance THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_scifi THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_tvmovie THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_thriller THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_war THEN 1 ELSE 0 END),
+  (CASE WHEN f.g_western THEN 1 ELSE 0 END)
+) AS feature_vec
+"""
+
 def _fetch_seeds(conn, user_id: str):
+    # CHANGED: We no longer read f.feature_vec (doesn't exist).
+    # Instead, compute it via FEATURE_JSON_SQL.
     with conn.cursor() as cur:
-        cur.execute("""
-            select s.tconst, s.weight, f.feature_vec
-            from analytics.int_user_seed_preferences s
-            join analytics.int_titles_features f using (tconst)
-            where s.user_id = %s
+        cur.execute(f"""
+            SELECT s.tconst, s.weight, {FEATURE_JSON_SQL}
+            FROM analytics.int_user_seed_preferences s
+            JOIN analytics.int_titles_features f USING (tconst)
+            WHERE s.user_id = %s
         """, (user_id,))
         rows = cur.fetchall()
         return [{"tconst": r[0], "weight": float(r[1]), "vec": json.loads(r[2])} for r in rows]
@@ -67,31 +127,57 @@ def _build_pref_vector(seeds: List[dict]) -> Optional[List[float]]:
             acc[i] += w * v[i]
     return acc
 
-def _fetch_candidates(conn, since_year: Optional[int], min_votes: int,
-                      genre_any: Optional[List[str]], exclude_tconsts: List[str]):
-
-    where = ["f.vote_count >= %s", "f.year >= %s"]
+def _fetch_candidates(conn,
+                      since_year: Optional[int],
+                      min_votes: int,
+                      genre_any: Optional[List[str]],
+                      exclude_tconsts: List[str],
+                      title_types: Optional[str] = None):
+    # CHANGED: align names with view: f.start_year, f.num_votes
+    where = ["f.num_votes >= %s", "f.start_year >= %s"]
     params: List[object] = [min_votes, since_year or 0]
 
-    # genre filter: any match
-    genre_sql = []
+    # genre filter: any match among provided
     if genre_any:
+        ors = []
         for g in genre_any:
-            g = g.strip().lower()
-            # map input “comedy” -> column is_comedy
-            genre_col = f"is_{g}"
-            genre_sql.append(f"f.{genre_col} = true")
-        if genre_sql:
-            where.append("(" + " OR ".join(genre_sql) + ")")
+            token = g.strip().lower().replace("-", " ")
+            token = token if token in GENRE_TO_COL else g.strip().lower()
+            col = GENRE_TO_COL.get(token)
+            if col:
+                ors.append(f"f.{col} = TRUE")
+        if ors:
+            where.append("(" + " OR ".join(ors) + ")")
 
     if exclude_tconsts:
         where.append("f.tconst <> ALL(%s)")
         params.append(exclude_tconsts)
 
+    # titleType filter (defaults to 'movie' at the endpoint layer)
+    types = tuple(t.strip() for t in title_types.split(",")) if title_types else tuple()
+    title_filter_sql = ""
+    if types:
+        if len(types) == 1:
+            title_filter_sql = ' AND b."titleType" = %s'
+            params.append(types[0])
+        else:
+            placeholders = ",".join(["%s"] * len(types))
+            title_filter_sql = f' AND b."titleType" IN ({placeholders})'
+            params.extend(types)
+
     sql = f"""
-        select f.tconst, f.title, f.original_title, f.year, f.vote_count, f.feature_vec
-        from analytics.int_titles_features f
-        where {" AND ".join(where)}
+        SELECT
+          f.tconst,
+          f.primary_title,
+          f.english_title,
+          f.start_year,
+          f.average_rating,
+          f.num_votes,
+          {FEATURE_JSON_SQL}
+        FROM analytics.int_titles_features f
+        JOIN stg_title_basics b ON b.tconst = f.tconst
+        WHERE {" AND ".join(where)}
+        {title_filter_sql}
     """
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -99,11 +185,12 @@ def _fetch_candidates(conn, since_year: Optional[int], min_votes: int,
         return [
             {
                 "tconst": r[0],
-                "title": r[1],
-                "original_title": r[2],
-                "year": r[3],
-                "vote_count": r[4],
-                "vec": json.loads(r[5]),
+                "primary_title": r[1],
+                "english_title": r[2],
+                "start_year": r[3],
+                "average_rating": float(r[4]) if r[4] is not None else None,
+                "num_votes": r[5],
+                "vec": json.loads(r[6]),
             }
             for r in rows
         ]
@@ -114,9 +201,13 @@ def recs_for_me(
     k: int = 25,
     min_votes: int = 100,
     since_year: int = 1900,
-    genre_any: Optional[str] = Query(None, description="comma-separated, e.g. Comedy,Horror")
+    genre_any: Optional[str] = None,
+    title_types: Optional[str] = Query(
+        "movie",
+        description="Comma-separated IMDb titleType filter, e.g. 'movie', 'movie,short', 'tvMovie'. Default: movie"
+    )
 ):
-    # parse genres if provided
+    # parse genres if provided (comma-separated; case-insensitive)
     genre_list = [g.strip() for g in genre_any.split(",")] if genre_any else None
 
     with psycopg.connect(DB_DSN) as conn:
@@ -132,19 +223,20 @@ def recs_for_me(
             raise HTTPException(status_code=400, detail="Invalid seed weights or vectors")
 
         exclude = [s["tconst"] for s in seeds]
-        cands = _fetch_candidates(conn, since_year, min_votes, genre_list, exclude)
+        cands = _fetch_candidates(conn, since_year, min_votes, genre_list, exclude, title_types)
 
-    # score candidates
+    # score candidates in Python via cosine
     scored = []
     for c in cands:
         score = _cosine(pref, c["vec"])
         if score > 0:
             scored.append({
                 "tconst": c["tconst"],
-                "title": c["title"],
-                "original_title": c["original_title"],
-                "year": c["year"],
-                "vote_count": c["vote_count"],
+                "primary_title": c["primary_title"],
+                "english_title": c["english_title"],
+                "start_year": c["start_year"],
+                "average_rating": c["average_rating"],
+                "num_votes": c["num_votes"],
                 "score": score,
             })
 
