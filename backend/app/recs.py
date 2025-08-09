@@ -26,6 +26,15 @@ def _ensure_vec(v):
         return [float(x) for x in json.loads(v)]
     # Fallback (shouldn't happen)
     return []
+  
+def _as_vec(value):
+    # psycopg3 usually returns JSON/JSONB as native Python (list/dict).
+    # If we ever get a string, fall back to json.loads.
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return json.loads(value)
+  
+
 
 
 router = APIRouter(prefix="/recs", tags=["recs"])
@@ -144,7 +153,8 @@ def _fetch_seeds(conn, user_id: str):
             WHERE s.user_id = %s
         """, (user_id,))
         rows = cur.fetchall()
-        return [{"tconst": r[0], "weight": float(r[1]), "vec": _ensure_vec(r[2])} for r in rows]
+        return [{"tconst": r[0], "weight": float(r[1]), "vec": _as_vec(r[2])} for r in rows]
+
 
 
 def _build_pref_vector(seeds: List[dict]) -> Optional[List[float]]:
