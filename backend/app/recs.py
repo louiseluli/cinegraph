@@ -14,6 +14,20 @@ import math
 import json
 import psycopg
 
+def _ensure_vec(v):
+    # psycopg usually returns JSON as a Python list already.
+    if isinstance(v, (list, tuple)):
+        return [float(x) for x in v]
+    if isinstance(v, memoryview):
+        v = v.tobytes()
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8")
+    if isinstance(v, str):
+        return [float(x) for x in json.loads(v)]
+    # Fallback (shouldn’t happen)
+    return []
+
+
 router = APIRouter(prefix="/recs", tags=["recs"])
 
 def _dsn() -> str:
@@ -130,7 +144,8 @@ def _fetch_seeds(conn, user_id: str):
             WHERE s.user_id = %s
         """, (user_id,))
         rows = cur.fetchall()
-        return [{"tconst": r[0], "weight": float(r[1]), "vec": json.loads(r[2])} for r in rows]
+        return [{"tconst": r[0], "weight": float(r[1]), "vec": _ensure_vec(r[2])} for r in rows]
+
 
 def _build_pref_vector(seeds: List[dict]) -> Optional[List[float]]:
     if not seeds:
@@ -211,7 +226,7 @@ def _fetch_candidates(conn,
                 "start_year": r[3],
                 "average_rating": float(r[4]) if r[4] is not None else None,
                 "num_votes": r[5],
-                "vec": json.loads(r[6]),
+                "vec": _ensure_vec(r[6]),
             }
             for r in rows
         ]
