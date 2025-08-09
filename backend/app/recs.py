@@ -24,7 +24,7 @@ def _ensure_vec(v):
         v = v.decode("utf-8")
     if isinstance(v, str):
         return [float(x) for x in json.loads(v)]
-    # Fallback (shouldn’t happen)
+    # Fallback (shouldn't happen)
     return []
 
 
@@ -163,15 +163,24 @@ def _build_pref_vector(seeds: List[dict]) -> Optional[List[float]]:
             acc[i] += w * v[i]
     return acc
 
-def _fetch_candidates(conn,
-                      since_year: Optional[int],
-                      min_votes: int,
-                      genre_any: Optional[List[str]],
-                      exclude_tconsts: List[str],
-                      title_types: Optional[str] = None):
+def _fetch_candidates(
+    conn,
+    since_year: Optional[int],
+    min_votes: int,
+    genre_any: Optional[List[str]],
+    exclude_tconsts: List[str],
+    title_types: Optional[str] = None,
+    lang_any: Optional[List[str]] = None,
+    region_any: Optional[List[str]] = None,
+    include_adult: bool = True,
+):
     # CHANGED: align names with view: f.start_year, f.num_votes
     where = ["f.num_votes >= %s", "f.start_year >= %s"]
     params: List[object] = [min_votes, since_year or 0]
+
+    # exclude adult unless explicitly allowed
+    if not include_adult:
+        where.append("COALESCE(f.f_is_adult, false) = false")
 
     # genre filter: any match among provided
     if genre_any:
@@ -200,6 +209,29 @@ def _fetch_candidates(conn,
             placeholders = ",".join(["%s"] * len(types))
             title_filter_sql = f' AND b."titleType" IN ({placeholders})'
             params.extend(types)
+
+    # AKA-based language/region filters via EXISTS
+    aka_filters = []
+    if lang_any:
+        aka_filters.append("""
+            EXISTS (
+              SELECT 1 FROM stg_title_akas a
+               WHERE a."titleId" = f.tconst
+                 AND a.language = ANY(%s)
+            )
+        """)
+        params.append(lang_any)
+    if region_any:
+        aka_filters.append("""
+            EXISTS (
+              SELECT 1 FROM stg_title_akas a
+               WHERE a."titleId" = f.tconst
+                 AND a.region = ANY(%s)
+            )
+        """)
+        params.append(region_any)
+    if aka_filters:
+        where.append("(" + " AND ".join(aka_filters) + ")")
 
     sql = f"""
         SELECT
@@ -241,10 +273,21 @@ def recs_for_me(
     title_types: Optional[str] = Query(
         "movie",
         description="Comma-separated IMDb titleType filter, e.g. 'movie', 'movie,short', 'tvMovie'. Default: movie"
-    )
+    ),
+    orig_lang_any: Optional[str] = Query(
+        None, description="Comma-separated ISO 639-1 language codes (from AKAs), e.g. 'en,fr'"
+    ),
+    aka_region_any: Optional[str] = Query(
+        None, description="Comma-separated regions in AKAs (e.g. 'US,GB,XWW')"
+    ),
+    include_adult: bool = Query(
+        False, description="Include adult titles (default: false)"
+    ),
 ):
     # parse genres if provided (comma-separated; case-insensitive)
     genre_list = [g.strip() for g in genre_any.split(",")] if genre_any else None
+    lang_list  = [x.strip() for x in orig_lang_any.split(",")] if orig_lang_any else None
+    region_list= [x.strip() for x in aka_region_any.split(",")] if aka_region_any else None
 
     with psycopg.connect(DB_DSN) as conn:
         seeds = _fetch_seeds(conn, user_id)
@@ -259,7 +302,17 @@ def recs_for_me(
             raise HTTPException(status_code=400, detail="Invalid seed weights or vectors")
 
         exclude = [s["tconst"] for s in seeds]
-        cands = _fetch_candidates(conn, since_year, min_votes, genre_list, exclude, title_types)
+        cands = _fetch_candidates(
+            conn,
+            since_year,
+            min_votes,
+            genre_list,
+            exclude,
+            title_types,
+            lang_list,
+            region_list,
+            include_adult,
+        )
 
     # score candidates in Python via cosine
     scored = []
