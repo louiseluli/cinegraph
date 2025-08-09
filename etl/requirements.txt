@@ -1,0 +1,4 @@
+# Minimal ETL deps for IMDb downloader/loader
+requests
+tqdm
+psycopg[binary]
