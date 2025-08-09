@@ -1,0 +1,85 @@
+# CineGraph dev stack — minimal, robust, and scalable
+# db starts by default; api/web stay opt-in via profiles.
+
+name: "${STACK_NAME:-cinegraph}"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: "${STACK_NAME:-cinegraph}-db"
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-cinegraph}"
+      POSTGRES_USER: "${POSTGRES_USER:-cinegraph_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-changeme_strong_password}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-cinegraph_user} -d ${POSTGRES_DB:-cinegraph} || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    env_file:
+      - .env
+    networks:
+      - cinegraph
+
+  api:
+    # Will be built after we add backend/Dockerfile
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: "${STACK_NAME:-cinegraph}-api"
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      APP_ENV: "${APP_ENV:-development}"
+      DATABASE_URL: "${DATABASE_URL}"
+      CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-http://localhost:3000}"
+      TMDB_API_KEY: "${TMDB_API_KEY}"
+      TMDB_READ_TOKEN: "${TMDB_READ_TOKEN}"
+      WIKIDATA_USER_AGENT: "${WIKIDATA_USER_AGENT:-CineGraph/0.1 (contact@example.com)}"
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["api"]
+    env_file:
+      - .env
+    networks:
+      - cinegraph
+
+  web:
+    # Will be built after we add frontend/Dockerfile
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: "${STACK_NAME:-cinegraph}-web"
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      NEXT_PUBLIC_APP_NAME: "${NEXT_PUBLIC_APP_NAME:-CineGraph}"
+      NEXT_PUBLIC_API_BASE: "${NEXT_PUBLIC_API_BASE:-http://localhost:8000}"
+    depends_on:
+      api:
+        condition: service_started
+    profiles: ["web"]
+    env_file:
+      - .env
+    networks:
+      - cinegraph
+
+volumes:
+  pgdata:
+
+networks:
+  cinegraph:
+    driver: bridge

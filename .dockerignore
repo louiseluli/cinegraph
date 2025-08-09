@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.env
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# Node
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# System / Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+dist/
+build/
+.cache/
+coverage/
+
+# Docker
+docker-compose.override.yml

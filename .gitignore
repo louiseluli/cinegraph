@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# System / Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# Build artifacts
+dist/
+build/
+.cache/
+coverage/
+
+# Docker
+docker-compose.override.yml
+
+# Env & secrets
+.env
+.env.*
+!.env.example  # keep the template, ignore real env files
+
+# Git
+.git-credentials
