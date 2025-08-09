@@ -5,7 +5,7 @@ IMDb -> Postgres staging loader (v0.1)
 What this script does:
 - Reads local IMDb *.tsv.gz files from --from (default: ./data/imdb)
 - Loads INTO Postgres staging tables (one per IMDb file), columns as TEXT
-- Converts '\N' -> NULL
+- Converts '\\N' -> NULL
 - Uses a replace-on-load strategy: load into <table>_new then swap
 - Adds minimal indexes on tconst/nconst for speed
 
@@ -130,27 +130,53 @@ def must_exist(path: Path) -> None:
     if not path.exists():
         raise SystemExit(f"File not found: {path}")
 
+def create_table(conn: psycopg.Connection, table: str, cols: List[Tuple[str, str]]) -> None:
+    """
+    Create table with QUOTED identifiers so mixedCase column names match COPY column list.
+    """
+    col_defs = [
+        sql.SQL("{} {}").format(sql.Identifier(name), sql.SQL(typ)) for name, typ in cols
+    ]
+    create_stmt = sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(
+        sql.Identifier(table),
+        sql.SQL(", ").join(col_defs),
+    )
+    with conn.cursor() as cur:
+        cur.execute(create_stmt)
 
-def create_table_sql(table: str, cols: List[Tuple[str, str]]) -> str:
-    cols_sql = ", ".join([f"{name} {typ}" for name, typ in cols])
-    return f"CREATE TABLE IF NOT EXISTS {table} ({cols_sql});"
-
-
-def create_indexes_sql(table: str) -> List[str]:
-    # minimal useful indexes
-    idx = []
+def create_indexes_sql(table: str) -> List[sql.SQL]:
+    stmts: List[sql.SQL] = []
     if table in ("stg_title_basics", "stg_title_crew", "stg_title_episode", "stg_title_principals", "stg_title_ratings"):
-        idx.append(f"CREATE INDEX IF NOT EXISTS {table}_tconst_idx ON {table}(tconst);")
+        stmts.append(
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}({})").format(
+                sql.Identifier(f"{table}_tconst_idx"),
+                sql.Identifier(table),
+                sql.Identifier("tconst"),
+            )
+        )
     if table in ("stg_name_basics", "stg_title_principals"):
-        idx.append(f"CREATE INDEX IF NOT EXISTS {table}_nconst_idx ON {table}(nconst);")
+        stmts.append(
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}({})").format(
+                sql.Identifier(f"{table}_nconst_idx"),
+                sql.Identifier(table),
+                sql.Identifier("nconst"),
+            )
+        )
     if table == "stg_title_akas":
-        idx.append(f"CREATE INDEX IF NOT EXISTS {table}_titleid_idx ON {table}(titleId);")
-    return idx
+        stmts.append(
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}({})").format(
+                sql.Identifier(f"{table}_titleid_idx"),
+                sql.Identifier(table),
+                sql.Identifier("titleId"),
+            )
+        )
+    return stmts
+
 
 
 def copy_file(conn: psycopg.Connection, table: str, file_path: Path, cols: List[Tuple[str, str]]) -> int:
     """
-    COPY data from gzip TSV to table_new, converting \N -> NULL.
+    COPY data from gzip TSV to table_new, converting \\N -> NULL.
     Returns number of rows loaded.
     """
     target_new = f"{table}_new"
@@ -158,11 +184,14 @@ def copy_file(conn: psycopg.Connection, table: str, file_path: Path, cols: List[
     with conn.cursor() as cur:
         # Drop & create temp _new table
         cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(target_new)))
-        cur.execute(sql.SQL(create_table_sql(target_new, cols)))
+        create_table(conn, target_new, cols)
+
 
         # Prepare COPY
         col_list = sql.SQL(', ').join(sql.Identifier(c) for c in col_names)
-        copy_sql = sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', HEADER TRUE, NULL '\N')").format(
+        copy_sql = sql.SQL(
+    "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', HEADER TRUE, NULL '\\\\N')"
+).format(
             sql.Identifier(target_new),
             col_list,
         )
@@ -182,7 +211,7 @@ def copy_file(conn: psycopg.Connection, table: str, file_path: Path, cols: List[
 
         # Indexes
         for stmt in create_indexes_sql(table):
-            cur.execute(stmt)
+          cur.execute(stmt)
 
         # Count rows
         cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table)))
