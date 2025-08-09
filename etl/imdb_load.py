@@ -190,11 +190,12 @@ def copy_file(conn: psycopg.Connection, table: str, file_path: Path, cols: List[
         # Prepare COPY
         col_list = sql.SQL(', ').join(sql.Identifier(c) for c in col_names)
         copy_sql = sql.SQL(
-    "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', HEADER TRUE, NULL '\\\\N')"
-).format(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', HEADER TRUE, NULL '\\\\N', QUOTE E'\\b', ESCAPE E'\\b')"
+        ).format(
             sql.Identifier(target_new),
             col_list,
         )
+
 
         # Stream gzip -> COPY
         with gzip.open(file_path, "rb") as gz:
