@@ -5,6 +5,7 @@
 # - Builds a single preference vector (weighted average) from seed rows
 # - Computes cosine similarity to candidate titles and returns top-k
 # - Supports filters: since_year, min_votes, genre_any (comma-separated), title_types
+#   plus orig_lang_any (AKAs.language), aka_region_any (AKAs.region), include_adult
 # - Uses container-safe DSN (db:5432) by default
 
 from typing import List, Optional
@@ -14,71 +15,38 @@ import math
 import json
 import psycopg
 
-def _ensure_vec(v):
-    # psycopg usually returns JSON as a Python list already.
-    if isinstance(v, (list, tuple)):
-        return [float(x) for x in v]
-    if isinstance(v, memoryview):
-        v = v.tobytes()
-    if isinstance(v, (bytes, bytearray)):
-        v = v.decode("utf-8")
-    if isinstance(v, str):
-        return [float(x) for x in json.loads(v)]
-    # Fallback (shouldn't happen)
-    return []
-  
-def _as_vec(value):
-    # psycopg3 usually returns JSON/JSONB as native Python (list/dict).
-    # If we ever get a string, fall back to json.loads.
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return json.loads(value)
-  
-
-
-
 router = APIRouter(prefix="/recs", tags=["recs"])
 
 def _dsn() -> str:
     # Prefer ANALYTICS_DSN or fall back to DATABASE_URL
     dsn = os.getenv("ANALYTICS_DSN") or os.getenv("DATABASE_URL") or ""
 
-    # If someone put a host-only DSN, keep it.
-    # If it uses localhost/127.0.0.1, rewrite to Docker service "db" on the correct internal port 5432.
-    # We normalize both host and port robustly.
+    # Normalize localhost to Docker service host "db:5432"
     def _normalize_local_to_db(s: str) -> str:
-        # Common cases:
-        #   postgresql://user:pass@localhost:5433/db -> ...@db:5432/db
-        #   postgresql://user:pass@127.0.0.1:5433/db -> ...@db:5432/db
-        #   postgresql://user:pass@localhost/db      -> ...@db:5432/db
+        # With explicit port
         for needle in ("@localhost:", "@127.0.0.1:"):
             if needle in s:
                 return s.replace(needle, "@db:5432:")
-        # handle no explicit port
+        # Without explicit port
         for needle in ("@localhost/", "@127.0.0.1/"):
             if needle in s:
                 return s.replace(needle, "@db:5432/")
         return s
 
     dsn = _normalize_local_to_db(dsn)
-
-    # Final fallback if empty
     return dsn or "postgresql://cinegraph_user:changeme_strong_password@db:5432/cinegraph"
-
 
 DB_DSN = _dsn()
 
-# Which columns become our feature vector (documentation only; we now build it in SQL)
-# These names match analytics.int_titles_features (see \d+ in your logs)
+# Documentation of the vector (the actual vector is built in SQL below)
 FEATURE_DOC = [
     "f_year_norm", "f_runtime_norm", "f_rating_norm",
-    # one-hots for genres present in the title (multi-hot)
     "g_action","g_adventure","g_animation","g_comedy","g_crime","g_documentary",
     "g_drama","g_family","g_fantasy","g_history","g_horror","g_music","g_mystery",
     "g_romance","g_scifi","g_tvmovie","g_thriller","g_war","g_western"
 ]
 
-# Map user-friendly genre tokens -> warehouse boolean columns
+# Map human tokens -> boolean columns in analytics.int_titles_features
 GENRE_TO_COL = {
     "action":"g_action",
     "adventure":"g_adventure",
@@ -94,7 +62,7 @@ GENRE_TO_COL = {
     "music":"g_music",
     "mystery":"g_mystery",
     "romance":"g_romance",
-    "sci-fi":"g_scifi",  # allow sci-fi
+    "sci-fi":"g_scifi",
     "scifi":"g_scifi",
     "science fiction":"g_scifi",
     "tv movie":"g_tvmovie",
@@ -112,8 +80,22 @@ def _cosine(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
-# --- Helper: same JSON feature vector expression used for seeds & candidates ---
-# We COALESCE to 0.0 and cast booleans to int so Python gets a clean list[float].
+def _as_vec(value):
+    """
+    psycopg3 usually returns JSON/JSONB as a native Python list.
+    If it's bytes/str, parse it. Always return a list[float|int].
+    """
+    if isinstance(value, (list, tuple)):
+        return [float(x) if isinstance(x, (int, float)) else float(x) for x in value]
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        return [float(x) if isinstance(x, (int, float)) else float(x) for x in json.loads(value)]
+    return []
+
+# Build the feature vector in SQL so seeds & candidates use the same definition
 FEATURE_JSON_SQL = """
 json_build_array(
   COALESCE(f.f_year_norm::double precision, 0.0),
@@ -143,8 +125,7 @@ json_build_array(
 """
 
 def _fetch_seeds(conn, user_id: str):
-    # CHANGED: We no longer read f.feature_vec (doesn't exist).
-    # Instead, compute it via FEATURE_JSON_SQL.
+    # Compute vectors on the fly from the features view
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT s.tconst, s.weight, {FEATURE_JSON_SQL}
@@ -155,12 +136,9 @@ def _fetch_seeds(conn, user_id: str):
         rows = cur.fetchall()
         return [{"tconst": r[0], "weight": float(r[1]), "vec": _as_vec(r[2])} for r in rows]
 
-
-
 def _build_pref_vector(seeds: List[dict]) -> Optional[List[float]]:
     if not seeds:
         return None
-    # weighted average
     total_w = sum(s["weight"] for s in seeds)
     if total_w <= 0:
         return None
@@ -182,35 +160,34 @@ def _fetch_candidates(
     title_types: Optional[str] = None,
     lang_any: Optional[List[str]] = None,
     region_any: Optional[List[str]] = None,
-    include_adult: bool = True,
+    include_adult: bool = False,
 ):
-    # CHANGED: align names with view: f.start_year, f.num_votes
     where = ["f.num_votes >= %s", "f.start_year >= %s"]
     params: List[object] = [min_votes, since_year or 0]
 
-    # exclude adult unless explicitly allowed
+    # Adult filter (default False)
     if not include_adult:
         where.append("COALESCE(f.f_is_adult, false) = false")
 
-    # genre filter: any match among provided
+    # Genre filter: OR over provided tokens
     if genre_any:
         ors = []
         for g in genre_any:
             token = g.strip().lower().replace("-", " ")
-            token = token if token in GENRE_TO_COL else g.strip().lower()
             col = GENRE_TO_COL.get(token)
             if col:
                 ors.append(f"f.{col} = TRUE")
         if ors:
             where.append("(" + " OR ".join(ors) + ")")
 
+    # Exclude seed titles
     if exclude_tconsts:
         where.append("f.tconst <> ALL(%s)")
         params.append(exclude_tconsts)
 
-    # titleType filter (defaults to 'movie' at the endpoint layer)
-    types = tuple(t.strip() for t in title_types.split(",")) if title_types else tuple()
+    # titleType filter on stg_title_basics
     title_filter_sql = ""
+    types = tuple(t.strip() for t in title_types.split(",")) if title_types else tuple()
     if types:
         if len(types) == 1:
             title_filter_sql = ' AND b."titleType" = %s'
@@ -220,7 +197,7 @@ def _fetch_candidates(
             title_filter_sql = f' AND b."titleType" IN ({placeholders})'
             params.extend(types)
 
-    # AKA-based language/region filters via EXISTS
+    # AKA-based filters via EXISTS
     aka_filters = []
     if lang_any:
         aka_filters.append("""
@@ -268,7 +245,7 @@ def _fetch_candidates(
                 "start_year": r[3],
                 "average_rating": float(r[4]) if r[4] is not None else None,
                 "num_votes": r[5],
-                "vec": _ensure_vec(r[6]),
+                "vec": _as_vec(r[6]),
             }
             for r in rows
         ]
@@ -285,19 +262,19 @@ def recs_for_me(
         description="Comma-separated IMDb titleType filter, e.g. 'movie', 'movie,short', 'tvMovie'. Default: movie"
     ),
     orig_lang_any: Optional[str] = Query(
-        None, description="Comma-separated ISO 639-1 language codes (from AKAs), e.g. 'en,fr'"
+        None, description="Comma-separated ISO 639-1 language codes from AKAs.language (e.g. 'en,fr')"
     ),
     aka_region_any: Optional[str] = Query(
-        None, description="Comma-separated regions in AKAs (e.g. 'US,GB,XWW')"
+        None, description="Comma-separated regions from AKAs.region (e.g. 'US,GB,XWW')"
     ),
     include_adult: bool = Query(
         False, description="Include adult titles (default: false)"
     ),
 ):
-    # parse genres if provided (comma-separated; case-insensitive)
-    genre_list = [g.strip() for g in genre_any.split(",")] if genre_any else None
-    lang_list  = [x.strip() for x in orig_lang_any.split(",")] if orig_lang_any else None
-    region_list= [x.strip() for x in aka_region_any.split(",")] if aka_region_any else None
+    # Parse lists from comma-separated query params
+    genre_list  = [g.strip() for g in genre_any.split(",")] if genre_any else None
+    lang_list   = [x.strip() for x in orig_lang_any.split(",")] if orig_lang_any else None
+    region_list = [x.strip() for x in aka_region_any.split(",")] if aka_region_any else None
 
     with psycopg.connect(DB_DSN) as conn:
         seeds = _fetch_seeds(conn, user_id)
@@ -324,7 +301,7 @@ def recs_for_me(
             include_adult,
         )
 
-    # score candidates in Python via cosine
+    # Score by cosine similarity
     scored = []
     for c in cands:
         score = _cosine(pref, c["vec"])
