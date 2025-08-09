@@ -1,0 +1,26 @@
+# analytics/profiles/profiles.yml
+cinegraph:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: localhost
+      port: 5433
+      user: cinegraph_user
+      password: changeme_strong_password
+      dbname: cinegraph
+      schema: analytics
+      threads: 4
+      keepalives_idle: 0
+      connect_timeout: 10
+    prod:
+      type: postgres
+      host: localhost
+      port: 5433
+      user: cinegraph_user
+      password: changeme_strong_password
+      dbname: cinegraph
+      schema: analytics_prod
+      threads: 8
+      keepalives_idle: 0
+      connect_timeout: 10
